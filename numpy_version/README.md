@@ -22,7 +22,7 @@ Rationale and design choices
 How to run
 1) Single-process demo (no MPI):
 ```bash
-python3 numpy-version/main.py --model least --epochs 20 --batch 32 --lr 0.01
+python3 numpy_version/main.py --model least --epochs 20 --batch 32 --lr 0.01
 ```
 
 Data generation and prediction
