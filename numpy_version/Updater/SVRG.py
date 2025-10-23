@@ -24,6 +24,11 @@ class SVRG:
         self.copy_grad = model.PrecomputeCoefficients(self.copy_para, self.x, self.y)
 
     def Update(self, model, x, y):
+        
+        # intialize snapshot if missing
+        if self.copy_para is None or self.copy_grad is None:
+            self.EpochBegin(model)
+
         grad1 = model.PrecomputeCoefficients(model.para, x, y)
         grad2 = model.PrecomputeCoefficients(self.copy_para, x, y)
         g = (grad1 - grad2) + self.copy_grad
