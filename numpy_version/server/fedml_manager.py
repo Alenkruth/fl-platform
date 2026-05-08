@@ -62,7 +62,7 @@ DEFAULT_SIM_DIR = Path("/data/akrish/firesim/simulation")
 # Fallback architectures when FL_ARCH is not received (legacy FPGA client images).
 DEFAULT_ARCHS = {
     "FPGA-NODE0": [3, 16, 1],
-    "FPGA-NODE1": [3, 16, 8, 1],
+    "FPGA-NODE1": [3, 16, 1],
 }
 DEFAULT_ARCH_FALLBACK = [3, 16, 1]
 
@@ -120,17 +120,19 @@ def decode_weights(b64_str: str) -> np.ndarray:
 # ── FPGA uartlog tail thread ──────────────────────────────────────────────────
 
 def tail_fpga_uartlog(log_path: Path, label: str, weight_q: queue.Queue):
-    """Wait for uartlog to appear, tail it, decode FL_ARCH/FL_TASK/FL_WEIGHTS_B64."""
-    mprint(f"[manager] [{label}] waiting for uartlog: {log_path}", flush=True)
+    """Wait for uartlog to appear, tail it, decode FL protocol lines.
+    Manager drives all console output — nothing is echoed from the uartlog."""
+    mprint(f"[manager] {label}: waiting for uartlog: {log_path}", flush=True)
     while not log_path.exists() and not _shutdown.is_set():
         time.sleep(1)
     if _shutdown.is_set():
         return
-    mprint(f"[manager] [{label}] tailing {log_path}", flush=True)
+    mprint(f"[manager] {label}: tailing {log_path}", flush=True)
     try:
         with open(log_path, "r", errors="replace") as f:
-            f.seek(0, 2)  # start from end — ignore log lines written before manager started
+            f.seek(0, 2)  # start from end — only process lines written after manager starts
             pending_b64 = ""
+            pending_loss = float("nan")
             while not _shutdown.is_set():
                 line = f.readline()
                 if not line:
@@ -138,61 +140,62 @@ def tail_fpga_uartlog(log_path: Path, label: str, weight_q: queue.Queue):
                     continue
                 line = line.rstrip()
 
-                # ── Architecture descriptor ───────────────────────────────────
                 if "FL_ARCH:" in line:
                     arch_str = line.split("FL_ARCH:", 1)[1].strip()
                     try:
-                        arch = [int(x) for x in arch_str.split(",")]
-                        _set_node_arch(label, arch)
-                        mprint(f"  [{label}] arch={arch}", flush=True)
+                        _set_node_arch(label, [int(x) for x in arch_str.split(",")])
                     except ValueError:
                         pass
 
-                # ── Task embedding ────────────────────────────────────────────
                 elif "FL_TASK:" in line:
-                    b64 = line.split("FL_TASK:", 1)[1].strip()
                     try:
                         task_vec = np.frombuffer(
-                            base64.b64decode(b64), dtype=np.float32).copy()
+                            base64.b64decode(line.split("FL_TASK:", 1)[1].strip()),
+                            dtype=np.float32).copy()
                         _set_node_task(label, task_vec)
                     except Exception:
                         pass
 
-                # ── Weight vector (with split-line reassembly) ────────────────
+                elif "FL_LOSS:" in line:
+                    try:
+                        pending_loss = float(line.split("FL_LOSS:", 1)[1].strip())
+                    except ValueError:
+                        pass
+
+                elif "FL_ROUND_DONE" in line and "loss=" in line:
+                    try:
+                        pending_loss = float(line.split("loss=", 1)[1].strip())
+                    except ValueError:
+                        pass
+
                 elif "FL_WEIGHTS_B64:" in line:
                     pending_b64 = line.split("FL_WEIGHTS_B64:", 1)[1].strip()
                     try:
                         w = decode_weights(pending_b64)
                         while not weight_q.empty():
-                            try:
-                                weight_q.get_nowait()
-                            except queue.Empty:
-                                break
-                        weight_q.put((w, float("nan")))
+                            try: weight_q.get_nowait()
+                            except queue.Empty: break
+                        weight_q.put((w, pending_loss))
                         pending_b64 = ""
+                        pending_loss = float("nan")
                     except Exception:
-                        pass  # incomplete — accumulate on next line
+                        pass  # incomplete line — accumulate
 
                 elif pending_b64:
                     pending_b64 += line.strip()
                     try:
                         w = decode_weights(pending_b64)
                         while not weight_q.empty():
-                            try:
-                                weight_q.get_nowait()
-                            except queue.Empty:
-                                break
-                        weight_q.put((w, float("nan")))
+                            try: weight_q.get_nowait()
+                            except queue.Empty: break
+                        weight_q.put((w, pending_loss))
                         pending_b64 = ""
+                        pending_loss = float("nan")
                     except Exception:
                         pass  # still incomplete
 
-                # ── Console passthrough ───────────────────────────────────────
-                if any(kw in line for kw in ("FL_ROUND", "FL_CLIENT", "loss=")):
-                    mprint(f"  [{label}] {line}", flush=True)
-
     except Exception as e:
-        mprint(f"[manager] [{label}] tail error: {e}", flush=True)
+        mprint(f"[manager] {label}: tail error: {e}", flush=True)
 
 
 # ── SW-EMU stream thread ──────────────────────────────────────────────────────
@@ -266,6 +269,14 @@ def main():
                         help="Number of FPGA nodes (default 1)")
     parser.add_argument("--sw-emu-nodes", type=int, default=0, metavar="M",
                         help="Number of SW-emulated host-side nodes (default 0)")
+    parser.add_argument("--sw-emu-archs", type=str, nargs="+", default=None,
+                        metavar="ARCH",
+                        help="Architecture per SW-EMU node as comma-separated sizes, "
+                             "e.g. 3,16,1 3,32,16,1  (overrides built-in SW_EMU_ARCHS)")
+    parser.add_argument("--fpga-archs",   type=str, nargs="+", default=None,
+                        metavar="ARCH",
+                        help="Architecture per FPGA node as comma-separated sizes, "
+                             "e.g. 3,16,1 3,16,1  (overrides built-in DEFAULT_ARCHS)")
     parser.add_argument("--sim-dir",      type=str, default=str(DEFAULT_SIM_DIR),
                         help=f"FireSim sim dir containing sim_slot_N/ "
                              f"(default: {DEFAULT_SIM_DIR})")
@@ -282,6 +293,14 @@ def main():
     args = parser.parse_args()
 
     os.chdir(Path(__file__).parent)
+
+    if args.sw_emu_archs is not None:
+        for i, spec in enumerate(args.sw_emu_archs):
+            SW_EMU_ARCHS[i] = [int(x) for x in spec.split(",")]
+
+    if args.fpga_archs is not None:
+        for i, spec in enumerate(args.fpga_archs):
+            DEFAULT_ARCHS[f"FPGA-NODE{i}"] = [int(x) for x in spec.split(",")]
 
     n_fpga   = args.fpga_nodes
     n_sw_emu = args.sw_emu_nodes
@@ -381,22 +400,30 @@ def main():
             round_num += 1
             mprint(f"\n[manager] ===== round {round_num} =====", flush=True)
 
-            # Collect one weight vector per node
+            # Collect one weight vector per node — poll all queues concurrently
+            # so a slow FPGA node doesn't block collection from faster nodes.
+            pending = set(all_labels)
             weights: dict[str, np.ndarray] = {}
-            for label in all_labels:
-                item = None
-                while item is None and not _shutdown.is_set():
+            losses:  dict[str, float]      = {}
+            while pending and not _shutdown.is_set():
+                for label in list(pending):
                     try:
-                        item = weight_queues[label].get(timeout=1.0)
+                        w, loss = weight_queues[label].get_nowait()
+                        weights[label] = w
+                        losses[label]  = loss
+                        pending.discard(label)
                     except queue.Empty:
-                        continue
-                if item is not None:
-                    w, loss = item
-                    weights[label] = w
-                    meta = _get_node_meta(label)
-                    loss_str = f"  loss={loss:.6f}" if not np.isnan(loss) else ""
-                    mprint(f"[manager] {label}: weights received  "
-                           f"arch={meta.get('arch', '?')}  n_params={w.size}{loss_str}", flush=True)
+                        pass
+                if pending:
+                    time.sleep(0.1)
+            for label in all_labels:
+                if label not in weights:
+                    continue
+                w, loss = weights[label], losses[label]
+                meta = _get_node_meta(label)
+                loss_str = f"  loss={loss:.6f}" if not np.isnan(loss) else ""
+                mprint(f"[manager] {label}: weights received  "
+                       f"arch={meta.get('arch', '?')}  n_params={w.size}{loss_str}", flush=True)
 
             if not weights:
                 break
