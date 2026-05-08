@@ -357,9 +357,11 @@ class TAHN:
 
             theta_tilde = info['weights'].flatten().astype(np.float32)
 
-            if label not in self._prev_gen:
-                # First contribution from this client — store as baseline, skip update
+            if label not in self._prev_gen or \
+                    self._prev_gen[label].shape != theta_tilde.shape:
+                # First round or arch changed — store as new baseline, skip backward
                 self._prev_gen[label] = theta_tilde.copy()
+                self._arch_cache[label] = arch
                 bwd_stats[label] = {'first_round': True, 'arch': arch,
                                     'n_params': len(theta_tilde)}
                 continue
