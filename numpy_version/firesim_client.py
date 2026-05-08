@@ -2,19 +2,21 @@
 """
 FireSim FL client — runs on the FPGA node inside the simulation.
 
-Trains a 2-layer DNN (3→16→1, 81 params) continuously in rounds.
-After each round:
-  - Overwrites /root/local_weights.npy with updated weights
-  - Prints FL_WEIGHTS_B64:<base64> to stdout (host reads this via uartlog)
-  - Prints FL_ROUND_DONE: round=N loss=X
+Architecture is selected by node_id:
+    node 0  →  FlexDNN([3, 16, 1])      (ShallowDNN, 81 params)
+    node 1+ →  FlexDNN([3, 16, 8, 1])   (DeepDNN,   209 params)
+
+After each local training round the client prints three lines to stdout,
+which the host manager captures via the uartlog:
+    FL_ARCH:<descriptor>         e.g. FL_ARCH:3,16,1
+    FL_TASK:<base64 float32[16]> data-statistics task embedding
+    FL_WEIGHTS_B64:<base64>      flat float32 weight vector
+    [label] FL_ROUND_DONE round=N loss=X
 
 Node ID is read from /var/firesim-node-id and used to seed a unique local
 dataset, simulating non-IID data across edge devices.
 
-Loads global model from --global-model at startup if the file exists.
-Exits cleanly on SIGTERM or SIGINT (sent by host or manual poweroff).
-
-Usage (inside simulation, run by fedml.service via run_fl.sh):
+Usage (inside simulation):
     python3.10 /root/fl-platform/numpy_version/firesim_client.py
     python3.10 /root/fl-platform/numpy_version/firesim_client.py --round-epochs 64
 """
@@ -28,11 +30,18 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from Model.DNNModel import DNNModel
+from Model.DNNModels import FlexDNN, make_task_embedding
 from Updater.SGD import SGD
 
-WEIGHTS_PATH = "/root/local_weights.npy"
-NODE_ID_PATH = "/var/firesim-node-id"
+WEIGHTS_PATH  = "/root/local_weights.npy"
+NODE_ID_PATH  = "/var/firesim-node-id"
+
+# Architecture per node ID: extend the list for more nodes.
+NODE_ARCHS = {
+    0: [3, 16, 1],       # ShallowDNN — 81 params
+    1: [3, 16, 8, 1],    # DeepDNN   — 209 params
+}
+DEFAULT_ARCH = [3, 16, 8, 1]   # fallback for node_id >= 2
 
 _running = True
 
@@ -42,7 +51,7 @@ def _handle_signal(sig, frame):
     _running = False
 
 
-def get_node_id():
+def get_node_id() -> int:
     try:
         with open(NODE_ID_PATH) as f:
             return int(f.read().strip())
@@ -50,15 +59,15 @@ def get_node_id():
         return 0
 
 
-def make_dataset(node_id):
+def make_dataset(node_id: int):
     rng = np.random.RandomState(42 + node_id * 997)
-    X = rng.randn(200, 3)
-    w = rng.randn(3, 1)
-    y = X @ w + 0.1 * rng.randn(200, 1)
+    X   = rng.randn(200, 3)
+    w   = rng.randn(3, 1)
+    y   = X @ w + 0.1 * rng.randn(200, 1)
     return X.astype(np.float64), y.astype(np.float64)
 
 
-def train_round(model, updater, X, y, epochs, batch, lr):
+def train_round(model, updater, X, y, epochs: int, batch: int, lr: float) -> float:
     n = len(X)
     last_loss = 0.0
     for _ in range(epochs):
@@ -92,34 +101,55 @@ def main():
 
     print(f"[{label}] FL_CLIENT_START node_id={node_id}", flush=True)
 
-    model = DNNModel(in_size=3, hidden_size=16, out_size=1)
+    # ── Build model for this node's architecture ──────────────────────────────
+    arch       = NODE_ARCHS.get(node_id, DEFAULT_ARCH)
+    model      = FlexDNN(arch)
+    arch_b64   = model.arch_descriptor          # e.g. "3,16,1"
+    n_params   = model.NumParameters()
+
+    print(f"[{label}] arch={arch_b64}  params={n_params}", flush=True)
 
     if os.path.exists(args.global_model):
         flat = np.load(args.global_model).flatten()
-        model.para = flat.reshape(-1, 1).astype(np.float64)
-        model._unpack_para()
-        print(f"[{label}] loaded global model shape={flat.shape}", flush=True)
+        if flat.size == n_params:
+            model.para = flat.reshape(-1, 1).astype(np.float64)
+            model._unpack_para()
+            print(f"[{label}] loaded global model shape={flat.shape}", flush=True)
+        else:
+            print(f"[{label}] global model size mismatch "
+                  f"({flat.size} vs {n_params}) — random init", flush=True)
     else:
         print(f"[{label}] no global model — random init", flush=True)
 
-    X, y     = make_dataset(node_id)
-    updater  = SGD(model.NumParameters(), X, y)
+    X, y    = make_dataset(node_id)
+    updater = SGD(model.NumParameters(), X, y)
 
-    print(f"[{label}] dataset: {len(X)} samples | round_epochs={args.round_epochs} lr={args.lr}", flush=True)
+    # ── Task embedding (computed once from local data statistics) ─────────────
+    task_vec  = make_task_embedding(X, y, node_id)   # float32[16]
+    task_b64  = base64.b64encode(task_vec.tobytes()).decode("ascii")
+
+    print(f"[{label}] dataset: {len(X)} samples | "
+          f"round_epochs={args.round_epochs} lr={args.lr}", flush=True)
 
     round_num = 0
     while _running:
         round_num += 1
         print(f"[{label}] FL_ROUND_START round={round_num}", flush=True)
 
-        loss = train_round(model, updater, X, y, args.round_epochs, args.batch, args.lr)
+        loss = train_round(model, updater, X, y,
+                           args.round_epochs, args.batch, args.lr)
 
         np.save(WEIGHTS_PATH, model.para)
 
         flat = model.para.flatten().astype(np.float32)
-        b64  = base64.b64encode(flat.tobytes()).decode("ascii")
-        print(f"FL_WEIGHTS_B64:{b64}", flush=True)
-        print(f"[{label}] FL_ROUND_DONE round={round_num} loss={loss:.6f}", flush=True)
+        w_b64 = base64.b64encode(flat.tobytes()).decode("ascii")
+
+        # These three lines are parsed by the host fedml_manager
+        print(f"FL_ARCH:{arch_b64}",  flush=True)
+        print(f"FL_TASK:{task_b64}",  flush=True)
+        print(f"FL_WEIGHTS_B64:{w_b64}", flush=True)
+        print(f"[{label}] FL_ROUND_DONE round={round_num} loss={loss:.6f}",
+              flush=True)
 
     print(f"[{label}] FL_CLIENT_EXIT rounds_completed={round_num}", flush=True)
 
