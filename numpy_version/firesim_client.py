@@ -90,7 +90,7 @@ def main():
     signal.signal(signal.SIGINT,  _handle_signal)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--round-epochs", type=int,   default=64)
+    parser.add_argument("--round-epochs", type=int,   default=256)
     parser.add_argument("--lr",           type=float, default=0.01)
     parser.add_argument("--batch",        type=int,   default=32)
     parser.add_argument("--global-model", type=str,   default="/root/global_model.npy")
