@@ -176,7 +176,7 @@ def main():
         w_b64 = base64.b64encode(flat.tobytes()).decode("ascii")
 
         # These three lines are parsed by the host fedml_manager
-        print(f"FL_ARCH:{arch_b64}",  flush=True)
+        print(f"FL_ARCH:{arch_str}",  flush=True)
         print(f"FL_TASK:{task_b64}",  flush=True)
         print(f"FL_WEIGHTS_B64:{w_b64}", flush=True)
         print(f"[{label}] FL_ROUND_DONE round={round_num} loss={loss:.6f}",
