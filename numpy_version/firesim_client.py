@@ -94,6 +94,9 @@ def main():
     parser.add_argument("--lr",           type=float, default=0.01)
     parser.add_argument("--batch",        type=int,   default=32)
     parser.add_argument("--global-model", type=str,   default="/root/global_model.npy")
+    parser.add_argument("--arch",         type=str,   default=None,
+                        help="Comma-separated layer sizes, e.g. --arch 3,16,8,1. "
+                             "Overrides the node_id-based default.")
     args = parser.parse_args()
 
     node_id = get_node_id()
@@ -102,7 +105,10 @@ def main():
     print(f"[{label}] FL_CLIENT_START node_id={node_id}", flush=True)
 
     # ── Build model for this node's architecture ──────────────────────────────
-    arch       = NODE_ARCHS.get(node_id, DEFAULT_ARCH)
+    if args.arch is not None:
+        arch = [int(x) for x in args.arch.split(",")]
+    else:
+        arch = NODE_ARCHS.get(node_id, DEFAULT_ARCH)
     model      = FlexDNN(arch)
     arch_b64   = model.arch_descriptor          # e.g. "3,16,1"
     n_params   = model.NumParameters()
