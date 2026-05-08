@@ -109,11 +109,36 @@ def main():
         arch = [int(x) for x in args.arch.split(",")]
     else:
         arch = NODE_ARCHS.get(node_id, DEFAULT_ARCH)
-    model      = FlexDNN(arch)
-    arch_b64   = model.arch_descriptor          # e.g. "3,16,1"
-    n_params   = model.NumParameters()
+    model    = FlexDNN(arch)
+    arch_str = model.arch_descriptor
+    n_params = model.NumParameters()
 
-    print(f"[{label}] arch={arch_b64}  params={n_params}", flush=True)
+    # ── Startup banner ────────────────────────────────────────────────────────
+    import datetime, platform as _platform
+    arch_arrow = " → ".join(str(s) for s in arch)
+    print("", flush=True)
+    print("╔════════════════════════════════════════════════════════════════╗", flush=True)
+    print("║             FedML Client on FPGA Emulation                     ║", flush=True)
+    print("╚════════════════════════════════════════════════════════════════╝", flush=True)
+    print("", flush=True)
+    print(f"  Execution Date : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"  Platform       : RISC-V BOOM via FireSim FPGA Emulation", flush=True)
+    print(f"  Python Version : {_platform.python_version()}", flush=True)
+    print(f"  Node ID        : {node_id}  ({label})", flush=True)
+    print("", flush=True)
+    print("  ══════════════════════════════════════════════════════════════", flush=True)
+    print("  CLIENT CONFIGURATION", flush=True)
+    print("  ══════════════════════════════════════════════════════════════", flush=True)
+    print(f"  Architecture   : {arch_arrow}", flush=True)
+    print(f"  Parameters     : {n_params}", flush=True)
+    print(f"  Round Epochs   : {args.round_epochs}", flush=True)
+    print(f"  Batch Size     : {args.batch}", flush=True)
+    print(f"  Learning Rate  : {args.lr}", flush=True)
+    print(f"  Dataset Size   : 200 samples (non-IID, seed={42 + node_id * 997})", flush=True)
+    print("", flush=True)
+    print("  Protocol: FL_ARCH → FL_TASK → FL_WEIGHTS_B64 per round", flush=True)
+    print("  ══════════════════════════════════════════════════════════════", flush=True)
+    print("", flush=True)
 
     if os.path.exists(args.global_model):
         flat = np.load(args.global_model).flatten()
